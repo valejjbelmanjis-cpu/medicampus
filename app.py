@@ -455,4 +455,5 @@ def main():
     seccion_chat(paciente)
 
 
-if __name__ 
+if __name__ == "__main__":
+    main()
