@@ -18,6 +18,8 @@ de demostración y NO reemplaza la validación de un profesional de salud.
 import os
 import json
 import csv
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 
 import streamlit as st
@@ -34,10 +36,26 @@ st.set_page_config(
     layout="wide",
 )
 
+
+def get_secret(name, default=""):
+    """Lee un valor desde st.secrets (Streamlit Cloud) o variables de
+    entorno (ejecución local), lo que esté disponible."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
 DATA_FILE = "registro_medicamentos.csv"
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+# Credenciales de correo para el envío de recordatorios
+EMAIL_USER = get_secret("EMAIL_USER")
+EMAIL_PASSWORD = get_secret("EMAIL_PASSWORD")
 
 # Base local de interacciones de DEMOSTRACIÓN (ampliar con fuentes reales:
 # vademécum, OMS, INVIMA, etc. antes de cualquier uso real)
@@ -72,9 +90,51 @@ def init_state():
     if "medicamentos" not in st.session_state:
         st.session_state.medicamentos = []
     if "estudiante" not in st.session_state:
-        st.session_state.estudiante = {"nombre": "", "programa": "", "edad": None}
+        st.session_state.estudiante = {"nombre": "", "programa": "", "edad": None, "correo": ""}
     if "chat_historial" not in st.session_state:
         st.session_state.chat_historial = []
+
+
+# ------------------------------------------------------------------
+# ENVÍO DE RECORDATORIOS POR CORREO
+# ------------------------------------------------------------------
+
+def enviar_recordatorio_email(destinatario, medicamento):
+    """Envía un correo real de recordatorio usando Gmail SMTP.
+    Requiere EMAIL_USER y EMAIL_PASSWORD (App Password de Gmail)
+    configurados en Secrets. Devuelve (exito, mensaje)."""
+    if not EMAIL_USER or not EMAIL_PASSWORD:
+        return False, (
+            "No hay EMAIL_USER / EMAIL_PASSWORD configurados en Secrets. "
+            "Ve a la guía de configuración para activar el envío real."
+        )
+    if not destinatario:
+        return False, "Escribe primero el correo del estudiante en la barra lateral."
+
+    asunto = f"⏰ MediCampus — Recordatorio: {medicamento['nombre']}"
+    cuerpo = (
+        f"Hola,\n\n"
+        f"Este es tu recordatorio de MediCampus.\n\n"
+        f"Medicamento: {medicamento['nombre']}\n"
+        f"Dosis: {medicamento['dosis']}\n"
+        f"Frecuencia: cada {medicamento['frecuencia_horas']} horas\n"
+        f"Hora del recordatorio: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+        f"— MediCampus (prototipo académico, no reemplaza indicación médica)"
+    )
+
+    try:
+        msg = MIMEText(cuerpo)
+        msg["Subject"] = asunto
+        msg["From"] = EMAIL_USER
+        msg["To"] = destinatario
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(EMAIL_USER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_USER, [destinatario], msg.as_string())
+        return True, f"Correo enviado a {destinatario} ✅"
+    except Exception as e:
+        return False, f"Error enviando correo: {e}"
 
 
 # ------------------------------------------------------------------
@@ -212,8 +272,15 @@ def sidebar_estudiante():
         "Programa académico", st.session_state.estudiante["programa"])
     st.session_state.estudiante["edad"] = st.sidebar.number_input(
         "Edad", min_value=15, max_value=99, value=st.session_state.estudiante["edad"] or 20)
+    st.session_state.estudiante["correo"] = st.sidebar.text_input(
+        "Correo para recordatorios", st.session_state.estudiante.get("correo", ""))
 
     st.sidebar.markdown("---")
+    if not EMAIL_USER or not EMAIL_PASSWORD:
+        st.sidebar.warning("Recordatorios por correo: no configurados (ver Secrets).")
+    else:
+        st.sidebar.success("Recordatorios por correo activados ✅")
+
     if not ANTHROPIC_API_KEY:
         st.sidebar.warning(
             "No hay ANTHROPIC_API_KEY configurada. La app funcionará en "
@@ -285,6 +352,21 @@ def seccion_panel():
             "Próxima dosis": proxima.strftime("%d/%m/%Y %H:%M"),
         })
     st.dataframe(pd.DataFrame(filas), use_container_width=True)
+
+    st.markdown("**📧 Enviar recordatorio ahora** (demo en vivo — en producción esto lo dispararía un programador de tareas a la hora exacta):")
+    for i, m in enumerate(st.session_state.medicamentos):
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.write(f"{m['nombre']} — {m['dosis']}")
+        with col_b:
+            if st.button("Enviar", key=f"enviar_{i}"):
+                ok, mensaje = enviar_recordatorio_email(
+                    st.session_state.estudiante.get("correo", ""), m
+                )
+                if ok:
+                    st.success(mensaje)
+                else:
+                    st.error(mensaje)
 
     alertas = verificar_interacciones(st.session_state.medicamentos)
     if alertas:
