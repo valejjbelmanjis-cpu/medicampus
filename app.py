@@ -3,13 +3,13 @@ MediCampus - Asistente de medicamentos para estudiantes universitarios
 Proyecto transversal IA
 
 Funcionalidades:
-1. Registro de estudiante y medicamentos
-2. Panel de próximas dosis / recordatorios
-3. Verificador básico de interacciones (base local de demostración)
-4. Asistente con IA:
-   - Extrae datos estructurados de una receta escrita en texto libre
-   - Responde preguntas del estudiante sobre sus medicamentos
-5. Registro de uso exportable a CSV (evidencia funcional)
+1. Registro de VARIOS estudiantes/pacientes, cada uno con su propio correo
+2. Registro manual o asistido por IA de medicamentos por paciente
+3. Panel de próximas dosis por paciente
+4. Verificador básico de interacciones (base local de demostración)
+5. Envío de recordatorio real por correo a CADA paciente individualmente
+6. Asistente de chat con IA
+7. Registro de uso exportable a CSV (evidencia funcional)
 
 IMPORTANTE: Este es un prototipo académico. La base de interacciones es
 de demostración y NO reemplaza la validación de un profesional de salud.
@@ -17,7 +17,6 @@ de demostración y NO reemplaza la validación de un profesional de salud.
 
 import os
 import json
-import csv
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
@@ -53,12 +52,9 @@ ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
-# Credenciales de correo para el envío de recordatorios
 EMAIL_USER = get_secret("EMAIL_USER")
 EMAIL_PASSWORD = get_secret("EMAIL_PASSWORD")
 
-# Base local de interacciones de DEMOSTRACIÓN (ampliar con fuentes reales:
-# vademécum, OMS, INVIMA, etc. antes de cualquier uso real)
 INTERACCIONES_DEMO = [
     {"a": "ibuprofeno", "b": "warfarina", "riesgo": "ALTO",
      "detalle": "Puede aumentar el riesgo de sangrado."},
@@ -83,42 +79,50 @@ FRECUENCIA_HORAS = {
 
 
 # ------------------------------------------------------------------
-# ESTADO DE SESIÓN
+# ESTADO DE SESIÓN — ahora es una LISTA de pacientes
 # ------------------------------------------------------------------
 
 def init_state():
-    if "medicamentos" not in st.session_state:
-        st.session_state.medicamentos = []
-    if "estudiante" not in st.session_state:
-        st.session_state.estudiante = {"nombre": "", "programa": "", "edad": None, "correo": ""}
+    if "pacientes" not in st.session_state:
+        st.session_state.pacientes = []  # cada uno: {nombre, correo, programa, medicamentos: []}
+    if "paciente_activo" not in st.session_state:
+        st.session_state.paciente_activo = None
     if "chat_historial" not in st.session_state:
         st.session_state.chat_historial = []
 
 
+def obtener_paciente_activo():
+    for p in st.session_state.pacientes:
+        if p["nombre"] == st.session_state.paciente_activo:
+            return p
+    return None
+
+
 # ------------------------------------------------------------------
-# ENVÍO DE RECORDATORIOS POR CORREO
+# ENVÍO DE RECORDATORIOS POR CORREO (a cada paciente, individualmente)
 # ------------------------------------------------------------------
 
-def enviar_recordatorio_email(destinatario, medicamento):
-    """Envía un correo real de recordatorio usando Gmail SMTP.
-    Requiere EMAIL_USER y EMAIL_PASSWORD (App Password de Gmail)
-    configurados en Secrets. Devuelve (exito, mensaje)."""
+def enviar_recordatorio_email(paciente, medicamento, hora_toma):
+    """Envía un correo real al correo PROPIO del paciente, con el
+    medicamento y la hora exacta a la que debe tomarlo."""
     if not EMAIL_USER or not EMAIL_PASSWORD:
         return False, (
             "No hay EMAIL_USER / EMAIL_PASSWORD configurados en Secrets. "
-            "Ve a la guía de configuración para activar el envío real."
+            "Configúralos para activar el envío real."
         )
+    destinatario = paciente.get("correo", "")
     if not destinatario:
-        return False, "Escribe primero el correo del estudiante en la barra lateral."
+        return False, f"{paciente['nombre']} no tiene correo registrado."
 
-    asunto = f"⏰ MediCampus — Recordatorio: {medicamento['nombre']}"
+    asunto = f"⏰ MediCampus — Recordatorio para {paciente['nombre']}: {medicamento['nombre']}"
     cuerpo = (
-        f"Hola,\n\n"
+        f"Hola {paciente['nombre']},\n\n"
         f"Este es tu recordatorio de MediCampus.\n\n"
         f"Medicamento: {medicamento['nombre']}\n"
         f"Dosis: {medicamento['dosis']}\n"
-        f"Frecuencia: cada {medicamento['frecuencia_horas']} horas\n"
-        f"Hora del recordatorio: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+        f"Debes tomarlo a las: {hora_toma.strftime('%d/%m/%Y %H:%M')}\n"
+        f"Frecuencia: cada {medicamento['frecuencia_horas']} horas\n\n"
+        f"Este recordatorio quedó registrado en tu historial de MediCampus.\n\n"
         f"— MediCampus (prototipo académico, no reemplaza indicación médica)"
     )
 
@@ -132,9 +136,27 @@ def enviar_recordatorio_email(destinatario, medicamento):
             server.starttls()
             server.login(EMAIL_USER, EMAIL_PASSWORD)
             server.sendmail(EMAIL_USER, [destinatario], msg.as_string())
-        return True, f"Correo enviado a {destinatario} ✅"
+
+        registrar_envio(paciente, medicamento, hora_toma)
+        return True, f"Correo enviado a {paciente['nombre']} ({destinatario}) ✅"
     except Exception as e:
         return False, f"Error enviando correo: {e}"
+
+
+def registrar_envio(paciente, medicamento, hora_toma):
+    """Guarda evidencia del envío en el CSV (funcionalidad + evidencia)."""
+    fila = pd.DataFrame([{
+        "fecha_envio": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "paciente": paciente["nombre"],
+        "correo": paciente.get("correo", ""),
+        "medicamento": medicamento["nombre"],
+        "dosis": medicamento["dosis"],
+        "hora_toma_programada": hora_toma.strftime("%Y-%m-%d %H:%M:%S"),
+    }])
+    if os.path.exists(DATA_FILE):
+        fila.to_csv(DATA_FILE, mode="a", header=False, index=False)
+    else:
+        fila.to_csv(DATA_FILE, index=False)
 
 
 # ------------------------------------------------------------------
@@ -142,8 +164,6 @@ def enviar_recordatorio_email(destinatario, medicamento):
 # ------------------------------------------------------------------
 
 def _llamar_claude(prompt, system=""):
-    """Llama a la API de Claude. Si no hay API key configurada,
-    devuelve None para que el resto del código use un modo de respaldo."""
     if not ANTHROPIC_API_KEY:
         return None
     try:
@@ -170,9 +190,6 @@ def _llamar_claude(prompt, system=""):
 
 
 def extraer_receta_con_ia(texto_libre):
-    """Usa el modelo para convertir una receta en texto libre a JSON
-    estructurado: nombre, dosis, frecuencia. Con respaldo por reglas
-    simples si no hay API key disponible."""
     system = (
         "Extraes datos de recetas médicas en español y respondes SOLO "
         "con JSON válido, sin texto adicional, con este formato: "
@@ -187,7 +204,6 @@ def extraer_receta_con_ia(texto_libre):
         except Exception:
             pass
 
-    # --- Modo de respaldo (sin API key): heurística simple ---
     texto = texto_libre.lower()
     horas = 8
     for frase, h in [("cada 6", 6), ("cada 8", 8), ("cada 12", 12), ("cada 24", 24), ("diari", 24)]:
@@ -206,18 +222,16 @@ def responder_pregunta_ia(pregunta, medicamentos):
     system = (
         "Eres un asistente educativo de MediCampus, un prototipo estudiantil. "
         "Respondes de forma breve y clara sobre uso general de medicamentos. "
-        "SIEMPRE aclaras que no reemplazas a un profesional de salud y que "
-        "ante dudas serias se debe consultar a un médico o farmacéutico. "
+        "SIEMPRE aclaras que no reemplazas a un profesional de salud. "
         "No das diagnósticos ni indicaciones de dosis distintas a las recetadas."
     )
-    prompt = f"Medicamentos actuales del estudiante: {contexto}.\nPregunta: {pregunta}"
+    prompt = f"Medicamentos actuales del paciente: {contexto}.\nPregunta: {pregunta}"
     respuesta = _llamar_claude(prompt, system=system)
     if respuesta:
         return respuesta
     return (
-        "⚠️ Modo de respaldo (sin conexión a la IA): no puedo generar una "
-        "respuesta personalizada ahora mismo. Por favor consulta a un "
-        "profesional de salud o configura la variable ANTHROPIC_API_KEY."
+        "⚠️ Modo de respaldo (sin conexión a la IA): configura ANTHROPIC_API_KEY "
+        "para respuestas generadas, o consulta a un profesional de salud."
     )
 
 
@@ -242,38 +256,42 @@ def calcular_proxima_dosis(hora_inicio, frecuencia_horas):
     return proxima
 
 
-def guardar_registro(estudiante, medicamentos):
-    filas = []
-    for m in medicamentos:
-        filas.append({
-            "fecha_registro": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "estudiante": estudiante["nombre"],
-            "programa": estudiante["programa"],
-            "medicamento": m["nombre"],
-            "dosis": m["dosis"],
-            "frecuencia_horas": m["frecuencia_horas"],
-        })
-    df_nuevo = pd.DataFrame(filas)
-    if os.path.exists(DATA_FILE):
-        df_nuevo.to_csv(DATA_FILE, mode="a", header=False, index=False)
-    else:
-        df_nuevo.to_csv(DATA_FILE, index=False)
-
-
 # ------------------------------------------------------------------
 # INTERFAZ
 # ------------------------------------------------------------------
 
-def sidebar_estudiante():
-    st.sidebar.header("👤 Datos del estudiante")
-    st.session_state.estudiante["nombre"] = st.sidebar.text_input(
-        "Nombre", st.session_state.estudiante["nombre"])
-    st.session_state.estudiante["programa"] = st.sidebar.text_input(
-        "Programa académico", st.session_state.estudiante["programa"])
-    st.session_state.estudiante["edad"] = st.sidebar.number_input(
-        "Edad", min_value=15, max_value=99, value=st.session_state.estudiante["edad"] or 20)
-    st.session_state.estudiante["correo"] = st.sidebar.text_input(
-        "Correo para recordatorios", st.session_state.estudiante.get("correo", ""))
+def sidebar_gestion_pacientes():
+    st.sidebar.header("👥 Pacientes / estudiantes")
+
+    with st.sidebar.form("form_nuevo_paciente", clear_on_submit=True):
+        st.write("**Agregar nuevo paciente**")
+        nombre = st.text_input("Nombre")
+        correo = st.text_input("Correo (aquí le llegarán SUS recordatorios)")
+        programa = st.text_input("Programa académico (opcional)")
+        agregar = st.form_submit_button("➕ Agregar paciente")
+        if agregar:
+            if nombre and correo:
+                if any(p["nombre"] == nombre for p in st.session_state.pacientes):
+                    st.sidebar.error("Ya existe un paciente con ese nombre.")
+                else:
+                    st.session_state.pacientes.append({
+                        "nombre": nombre, "correo": correo, "programa": programa,
+                        "medicamentos": [],
+                    })
+                    st.session_state.paciente_activo = nombre
+                    st.sidebar.success(f"{nombre} agregado.")
+            else:
+                st.sidebar.error("Nombre y correo son obligatorios.")
+
+    st.sidebar.markdown("---")
+
+    if st.session_state.pacientes:
+        nombres = [p["nombre"] for p in st.session_state.pacientes]
+        idx_actual = nombres.index(st.session_state.paciente_activo) if st.session_state.paciente_activo in nombres else 0
+        seleccion = st.sidebar.selectbox("Paciente activo", nombres, index=idx_actual)
+        st.session_state.paciente_activo = seleccion
+    else:
+        st.sidebar.info("Agrega al menos un paciente para empezar.")
 
     st.sidebar.markdown("---")
     if not EMAIL_USER or not EMAIL_PASSWORD:
@@ -282,16 +300,13 @@ def sidebar_estudiante():
         st.sidebar.success("Recordatorios por correo activados ✅")
 
     if not ANTHROPIC_API_KEY:
-        st.sidebar.warning(
-            "No hay ANTHROPIC_API_KEY configurada. La app funcionará en "
-            "modo de respaldo (sin IA generativa) para que puedas probarla igual."
-        )
+        st.sidebar.warning("Sin ANTHROPIC_API_KEY: modo de respaldo activo para la IA.")
     else:
         st.sidebar.success("Asistente IA conectado ✅")
 
 
-def seccion_registrar_medicamento():
-    st.subheader("💊 Registrar medicamento")
+def seccion_registrar_medicamento(paciente):
+    st.subheader(f"💊 Registrar medicamento para {paciente['nombre']}")
     tab_manual, tab_ia = st.tabs(["Formulario manual", "Pegar receta (IA extrae los datos)"])
 
     with tab_manual:
@@ -305,13 +320,13 @@ def seccion_registrar_medicamento():
 
         if st.button("Agregar medicamento", key="btn_manual"):
             if nombre:
-                st.session_state.medicamentos.append({
+                paciente["medicamentos"].append({
                     "nombre": nombre,
                     "dosis": dosis or "No especificada",
                     "frecuencia_horas": FRECUENCIA_HORAS[frecuencia],
                     "hora_inicio": datetime.now(),
                 })
-                st.success(f"'{nombre}' agregado.")
+                st.success(f"'{nombre}' agregado a {paciente['nombre']}.")
             else:
                 st.error("Escribe al menos el nombre del medicamento.")
 
@@ -324,7 +339,7 @@ def seccion_registrar_medicamento():
             if texto.strip():
                 with st.spinner("Analizando receta..."):
                     datos, modo = extraer_receta_con_ia(texto)
-                st.session_state.medicamentos.append({
+                paciente["medicamentos"].append({
                     "nombre": datos.get("nombre", "Medicamento"),
                     "dosis": datos.get("dosis", "No especificada"),
                     "frecuencia_horas": int(datos.get("frecuencia_horas", 8)),
@@ -336,14 +351,16 @@ def seccion_registrar_medicamento():
                 st.error("Pega el texto de la receta primero.")
 
 
-def seccion_panel():
-    st.subheader("📋 Mis medicamentos y próximas dosis")
-    if not st.session_state.medicamentos:
-        st.info("Aún no has registrado medicamentos.")
+def seccion_panel(paciente):
+    st.subheader(f"📋 Medicamentos de {paciente['nombre']} ({paciente.get('correo', 'sin correo')})")
+    medicamentos = paciente["medicamentos"]
+
+    if not medicamentos:
+        st.info("Este paciente aún no tiene medicamentos registrados.")
         return
 
     filas = []
-    for m in st.session_state.medicamentos:
+    for m in medicamentos:
         proxima = calcular_proxima_dosis(m["hora_inicio"], m["frecuencia_horas"])
         filas.append({
             "Medicamento": m["nombre"],
@@ -353,37 +370,47 @@ def seccion_panel():
         })
     st.dataframe(pd.DataFrame(filas), use_container_width=True)
 
-    st.markdown("**📧 Enviar recordatorio ahora** (demo en vivo — en producción esto lo dispararía un programador de tareas a la hora exacta):")
-    for i, m in enumerate(st.session_state.medicamentos):
+    st.markdown(
+        "**📧 Enviar recordatorio ahora** — le llega directo al correo "
+        f"de **{paciente['nombre']}**, con el medicamento y la hora exacta "
+        "de la próxima toma (en producción esto lo dispara un programador "
+        "de tareas automáticamente a esa hora):"
+    )
+    for i, m in enumerate(medicamentos):
+        proxima = calcular_proxima_dosis(m["hora_inicio"], m["frecuencia_horas"])
         col_a, col_b = st.columns([3, 1])
         with col_a:
-            st.write(f"{m['nombre']} — {m['dosis']}")
+            st.write(f"{m['nombre']} — {m['dosis']} — próxima toma: {proxima.strftime('%d/%m/%Y %H:%M')}")
         with col_b:
-            if st.button("Enviar", key=f"enviar_{i}"):
-                ok, mensaje = enviar_recordatorio_email(
-                    st.session_state.estudiante.get("correo", ""), m
-                )
+            if st.button("Enviar", key=f"enviar_{paciente['nombre']}_{i}"):
+                ok, mensaje = enviar_recordatorio_email(paciente, m, proxima)
                 if ok:
                     st.success(mensaje)
                 else:
                     st.error(mensaje)
 
-    alertas = verificar_interacciones(st.session_state.medicamentos)
+    alertas = verificar_interacciones(medicamentos)
     if alertas:
         st.error("⚠️ Posibles interacciones detectadas (base de demostración):")
         for a in alertas:
             st.write(f"- **{a['a'].capitalize()} + {a['b'].capitalize()}** — Riesgo {a['riesgo']}: {a['detalle']}")
-        st.caption("Esta verificación es una demostración académica. Confirma siempre con un profesional de salud.")
+        st.caption("Verificación de demostración académica. Confirma siempre con un profesional de salud.")
     else:
         st.success("No se detectaron interacciones en la base de demostración.")
 
-    if st.button("💾 Guardar registro (evidencia funcional)"):
-        guardar_registro(st.session_state.estudiante, st.session_state.medicamentos)
-        st.success(f"Registro guardado en {DATA_FILE}")
+
+def seccion_registro_general():
+    st.subheader("🗂️ Registro histórico de recordatorios enviados")
+    if os.path.exists(DATA_FILE):
+        df = pd.read_csv(DATA_FILE)
+        st.dataframe(df, use_container_width=True)
+        st.caption(f"Evidencia funcional guardada en `{DATA_FILE}`.")
+    else:
+        st.info("Aún no se ha enviado ningún recordatorio.")
 
 
-def seccion_chat():
-    st.subheader("🤖 Asistente MediCampus")
+def seccion_chat(paciente):
+    st.subheader(f"🤖 Asistente MediCampus — dudas de {paciente['nombre']}")
     st.caption("Responde dudas generales. No reemplaza a un profesional de salud.")
 
     for rol, texto in st.session_state.chat_historial:
@@ -394,7 +421,7 @@ def seccion_chat():
     if pregunta:
         st.session_state.chat_historial.append(("user", pregunta))
         with st.spinner("Pensando..."):
-            respuesta = responder_pregunta_ia(pregunta, st.session_state.medicamentos)
+            respuesta = responder_pregunta_ia(pregunta, paciente["medicamentos"])
         st.session_state.chat_historial.append(("assistant", respuesta))
         st.rerun()
 
@@ -405,20 +432,27 @@ def seccion_chat():
 
 def main():
     init_state()
-    sidebar_estudiante()
+    sidebar_gestion_pacientes()
 
     st.title("💊 MediCampus")
     st.markdown(
-        "Asistente universitario de adherencia a medicamentos. "
+        "Asistente universitario de adherencia a medicamentos, con "
+        "recordatorios individuales por correo para cada paciente. "
         "**Prototipo académico — no constituye consejo médico.**"
     )
 
-    seccion_registrar_medicamento()
+    paciente = obtener_paciente_activo()
+    if paciente is None:
+        st.warning("Agrega un paciente en la barra lateral izquierda para comenzar.")
+        return
+
+    seccion_registrar_medicamento(paciente)
     st.markdown("---")
-    seccion_panel()
+    seccion_panel(paciente)
     st.markdown("---")
-    seccion_chat()
+    seccion_registro_general()
+    st.markdown("---")
+    seccion_chat(paciente)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ 
