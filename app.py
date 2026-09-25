@@ -2,10 +2,21 @@
 MediCampus - Asistente de medicamentos multi-paciente
 ======================================================
 
-Versión 2.2 - Panel de administrador con gestión real
+Versión 2.3 - Recuperación de contraseña propia
 
-Cambios frente a la v2.1:
-  - El panel de administrador ahora permite ACTUAR, no solo ver:
+Cambios frente a la v2.2:
+  - Nueva pestaña "¿Olvidaste tu contraseña?" en el login: permite a
+    cualquier paciente (incluido el administrador) restablecer su propia
+    contraseña usando un código de recuperación (secreto RECOVERY_CODE),
+    sin necesitar iniciar sesión primero. Esto evita el candado circular
+    de perder la contraseña de admin y no poder entrar al panel de admin
+    para resetearla.
+  - IMPORTANTE: agrega RECOVERY_CODE en Secrets (una cadena que solo tú
+    conozcas) para que esta pestaña funcione. Sin ese secreto configurado,
+    la pestaña muestra una advertencia y no permite restablecer nada.
+
+Cambios frente a la v2.1 (ya incluidos):
+  - El panel de administrador permite ACTUAR, no solo ver:
       * Eliminar medicamentos de cualquier paciente.
       * Eliminar cuentas de pacientes (con confirmación explícita).
       * Restablecer la contraseña de un paciente (útil si te escribe porque
@@ -76,6 +87,13 @@ EMAIL_PASSWORD = get_secret("EMAIL_PASSWORD")
 # de EMAIL_USER (esa es solo la cuenta SMTP de envío). Puede ser el mismo
 # correo o uno distinto — quien inicie sesión con este correo ve el panel.
 ADMIN_EMAIL = get_secret("ADMIN_EMAIL")
+
+# Código de recuperación de contraseña. Sirve para restablecer tu propia
+# contraseña desde la pantalla de login sin necesitar entrar primero
+# (soluciona el candado circular: si pierdes tu contraseña de admin, ya no
+# puedes entrar al panel de admin para resetearla). Configúralo en Secrets
+# y NO lo compartas — quien lo tenga puede resetear cualquier contraseña.
+RECOVERY_CODE = get_secret("RECOVERY_CODE")
 
 # Zona horaria para calcular "próxima dosis" y enviar recordatorios a la
 # hora local correcta, sin importar en qué región esté el servidor.
@@ -274,6 +292,14 @@ def resetear_password_admin(patient_id, nueva_password):
 def obtener_paciente(patient_id):
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM pacientes WHERE id = ?", (patient_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def obtener_paciente_por_correo(correo):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM pacientes WHERE correo = ?", (correo.lower().strip(),)
+        ).fetchone()
         return dict(row) if row else None
 
 
@@ -702,7 +728,9 @@ def pantalla_login():
         "Regístrate una sola vez: tus medicamentos quedan guardados en tu cuenta."
     )
 
-    tab_login, tab_registro = st.tabs(["Iniciar sesión", "Crear cuenta"])
+    tab_login, tab_registro, tab_recuperar = st.tabs(
+        ["Iniciar sesión", "Crear cuenta", "¿Olvidaste tu contraseña?"]
+    )
 
     with tab_login:
         with st.form("form_login"):
@@ -748,6 +776,45 @@ def pantalla_login():
                         st.rerun()
                     except ValueError as e:
                         st.error(str(e))
+
+    with tab_recuperar:
+        st.caption(
+            "Restablece tu contraseña si la olvidaste, usando el código de "
+            "recuperación configurado en Secrets (RECOVERY_CODE). Si tú eres "
+            "quien administra la app, es el mismo código que pusiste ahí."
+        )
+        if not RECOVERY_CODE:
+            st.warning(
+                "RECOVERY_CODE no está configurado en Secrets. Agrégalo (una "
+                "cadena que solo tú conozcas) para poder usar esta opción."
+            )
+        else:
+            with st.form("form_recuperar"):
+                correo_rec = st.text_input("Tu correo", key="rec_correo")
+                codigo = st.text_input("Código de recuperación", type="password", key="rec_codigo")
+                nueva1 = st.text_input("Nueva contraseña", type="password", key="rec_pw1")
+                nueva2 = st.text_input("Confirmar nueva contraseña", type="password", key="rec_pw2")
+                enviar_rec = st.form_submit_button("Restablecer contraseña")
+                if enviar_rec:
+                    errores = []
+                    if codigo != RECOVERY_CODE:
+                        errores.append("Código de recuperación incorrecto.")
+                    if len(nueva1 or "") < 4:
+                        errores.append("La nueva contraseña debe tener al menos 4 caracteres.")
+                    if nueva1 != nueva2:
+                        errores.append("Las contraseñas no coinciden.")
+                    paciente_rec = obtener_paciente_por_correo(correo_rec) if correo_rec else None
+                    if not paciente_rec:
+                        errores.append("No existe ninguna cuenta registrada con ese correo.")
+                    if errores:
+                        for e in errores:
+                            st.error(e)
+                    else:
+                        resetear_password_admin(paciente_rec["id"], nueva1)
+                        st.success(
+                            "Contraseña restablecida. Ya puedes iniciar sesión con "
+                            "tu correo y la nueva contraseña, en la pestaña de al lado."
+                        )
 
 
 # ------------------------------------------------------------------
