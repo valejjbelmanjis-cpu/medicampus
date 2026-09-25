@@ -2,50 +2,22 @@
 MediCampus - Asistente de medicamentos multi-paciente
 ======================================================
 
-Versión 2.1 - Correcciones y panel de administrador
+Versión 2.2 - Panel de administrador con gestión real
 
-Cambios frente a la v2.0:
-  - Panel de administrador: define ADMIN_EMAIL en Secrets. El paciente cuyo
-    correo de inicio de sesión coincida con ADMIN_EMAIL ve un panel extra
-    con el total de pacientes, medicamentos y eventos, y el listado de
-    cuentas registradas. ADMIN_EMAIL es independiente de EMAIL_USER: este
-    último es solo la cuenta SMTP desde la que se envían los correos, no
-    define quién administra la app. Puedes usar el mismo correo o uno
-    distinto (tu correo personal, por ejemplo) — solo regístrate como
-    paciente normal con ese correo y automáticamente verás el panel.
-  - Hash de contraseñas reforzado con PBKDF2-HMAC-SHA256 (200.000
-    iteraciones) en vez de un solo SHA-256, sin depender de librerías
-    externas nuevas. NOTA: si ya tenías cuentas creadas con la v2.0, el
-    formato de hash cambió; esas cuentas deberán registrarse de nuevo.
-  - Zona horaria explícita (por defecto America/Bogota, configurable con
-    el secreto TIMEZONE) en vez de depender de la hora del servidor, para
-    que "próxima dosis" y los recordatorios salgan a la hora correcta sin
-    importar dónde esté desplegada la app.
-  - SQLite en modo WAL + busy_timeout, para reducir bloqueos "database is
-    locked" cuando el scheduler en segundo plano escribe al mismo tiempo
-    que un usuario interactúa con la app.
-  - Aviso visible sobre la limitación de Streamlit Community Cloud: si la
-    app se "duerme" por inactividad, el scheduler en segundo plano también
-    se detiene y no se enviarán recordatorios automáticos hasta que alguien
-    vuelva a abrir la app.
-  - Persistencia real en SQLite (medicamentos y pacientes ya no se pierden
-    al recargar la página). NOTA: en Streamlit Community Cloud el disco es
-    efímero: sobrevive a recargas y reinicios normales del contenedor, pero
-    un nuevo despliegue (git push) puede reiniciar el archivo. Para
-    persistencia garantizada a largo plazo, migrar a una base externa
-    (Postgres/Supabase) reutilizando las mismas funciones de esta capa.
-  - Login por correo + contraseña: cada paciente se registra UNA sola vez
-    y luego solo inicia sesión. Puede tener 1 o varios medicamentos sin
-    volver a crear su perfil.
-  - Envío automático de recordatorios (APScheduler) además del envío manual.
-    Corre en segundo plano mientras la app esté activa en el servidor.
-  - Editar y eliminar medicamentos y cuentas de paciente.
-  - Duración del tratamiento ("por 5 días"): el medicamento se marca como
-    finalizado automáticamente al vencer.
-  - Varias horas fijas al día (ej. mañana y noche) para el mismo medicamento.
-  - Confirmación de toma ("Ya la tomé") con control de stock/recompra.
-  - Validación de formato de correo.
-  - Exportación del historial en CSV y PDF.
+Cambios frente a la v2.1:
+  - El panel de administrador ahora permite ACTUAR, no solo ver:
+      * Eliminar medicamentos de cualquier paciente.
+      * Eliminar cuentas de pacientes (con confirmación explícita).
+      * Restablecer la contraseña de un paciente (útil si te escribe porque
+        no puede entrar) — puedes escribir una nueva o dejar el campo vacío
+        para que se genere una aleatoria segura, mostrada una sola vez.
+  - Se agregó la función resetear_password_admin() en la capa de BD.
+
+NOTA DE SEGURIDAD: el panel de admin se activa comparando el correo de
+inicio de sesión con el secreto ADMIN_EMAIL. Como el correo es único por
+cuenta, si otra persona conoce esa dirección y se registra con ella ANTES
+que tú, esa cuenta quedará con el panel de admin. Regístrate tú mismo con
+ese correo apenas despliegues la app para "reclamarlo".
 
 IMPORTANTE: Este es un prototipo académico. La base de interacciones es
 de demostración y NO reemplaza la validación de un profesional de salud.
@@ -285,6 +257,18 @@ def autenticar_paciente(correo, password):
         if _hash_password(password, row["salt"], iteraciones) != row["password_hash"]:
             return None
         return dict(row)
+
+
+def resetear_password_admin(patient_id, nueva_password):
+    """Establece una nueva contraseña para un paciente. Pensado para que el
+    administrador la use cuando un paciente no puede entrar a su cuenta."""
+    salt = secrets.token_hex(16)
+    pw_hash = _hash_password(nueva_password, salt)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE pacientes SET password_hash=?, salt=?, pbkdf2_iteraciones=? WHERE id=?",
+            (pw_hash, salt, PBKDF2_ITERACIONES, patient_id),
+        )
 
 
 def obtener_paciente(patient_id):
@@ -825,6 +809,87 @@ def seccion_admin():
     csv_bytes = pacientes_df.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Descargar listado de pacientes (CSV)", data=csv_bytes,
                         file_name="pacientes_medicampus.csv", mime="text/csv")
+
+    # ---------------------------------------------------------------
+    # GESTIÓN DE PACIENTES (nuevo en v2.2): aquí es donde el admin
+    # puede realmente actuar, no solo mirar.
+    # ---------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("**Gestión de pacientes**")
+    st.caption(
+        "Elimina medicamentos o cuentas de cualquier paciente, o restablece "
+        "su contraseña si te escribe porque no puede entrar."
+    )
+
+    with get_conn() as conn:
+        todos_pacientes = [dict(r) for r in conn.execute(
+            "SELECT id, nombre, correo FROM pacientes ORDER BY nombre"
+        ).fetchall()]
+
+    if not todos_pacientes:
+        st.info("Aún no hay pacientes registrados.")
+        return
+
+    opciones = {f"{p['nombre']} ({p['correo']})": p["id"] for p in todos_pacientes}
+    seleccion = st.selectbox("Selecciona un paciente", list(opciones.keys()), key="admin_sel_paciente")
+    pid_sel = opciones[seleccion]
+    paciente_sel = obtener_paciente(pid_sel)
+
+    if paciente_sel is None:
+        st.warning("Ese paciente ya no existe (puede que acabes de eliminarlo).")
+        return
+
+    meds_sel = obtener_medicamentos(pid_sel)
+    if meds_sel:
+        st.write(f"Medicamentos activos de **{paciente_sel['nombre']}**:")
+        for m in meds_sel:
+            colm1, colm2 = st.columns([4, 1])
+            with colm1:
+                st.write(f"- {m['nombre']} ({m['dosis']}) — {descripcion_horario(m)}")
+            with colm2:
+                if st.button("🗑️ Eliminar", key=f"admin_borrar_med_{m['id']}"):
+                    eliminar_medicamento(m["id"])
+                    st.success(f"Medicamento '{m['nombre']}' eliminado.")
+                    st.rerun()
+    else:
+        st.caption(f"{paciente_sel['nombre']} no tiene medicamentos activos.")
+
+    col_reset, col_del = st.columns(2)
+
+    with col_reset:
+        with st.expander("🔑 Restablecer contraseña"):
+            nueva_pw = st.text_input(
+                "Nueva contraseña (déjalo vacío para generar una aleatoria)",
+                type="password", key=f"admin_nueva_pw_{pid_sel}",
+            )
+            if st.button("Restablecer contraseña", key=f"admin_reset_pw_{pid_sel}"):
+                pw_final = nueva_pw.strip() if nueva_pw.strip() else secrets.token_urlsafe(9)
+                if len(pw_final) < 4:
+                    st.error("La contraseña debe tener al menos 4 caracteres.")
+                else:
+                    resetear_password_admin(pid_sel, pw_final)
+                    st.success(
+                        f"Contraseña restablecida para {paciente_sel['nombre']}. "
+                        f"Nueva contraseña: `{pw_final}` — cómunicasela de forma segura, "
+                        "no queda guardada en ningún otro lugar ni se envía sola por correo."
+                    )
+
+    with col_del:
+        with st.expander("⚠️ Eliminar cuenta de este paciente"):
+            st.caption(
+                "Esto borra la cuenta, sus medicamentos y su historial de forma "
+                "permanente. No se puede deshacer."
+            )
+            confirma = st.checkbox(
+                "Confirmo que quiero eliminar esta cuenta",
+                key=f"admin_confirma_borrado_{pid_sel}",
+            )
+            if confirma:
+                if st.button("Eliminar cuenta definitivamente",
+                              key=f"admin_borrar_cuenta_{pid_sel}"):
+                    eliminar_paciente(pid_sel)
+                    st.success(f"Cuenta de {paciente_sel['nombre']} eliminada.")
+                    st.rerun()
 
 
 # ------------------------------------------------------------------
