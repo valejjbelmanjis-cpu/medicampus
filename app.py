@@ -2,9 +2,16 @@
 MediCampus - Asistente de medicamentos multi-paciente
 ======================================================
 
-Versión 2.3 - Recuperación de contraseña propia
+Versión 2.4 - Gestión de pacientes desde la tabla del panel de admin
 
-Cambios frente a la v2.2:
+Cambios frente a la v2.3:
+  - En el panel de administrador, la tabla "Pacientes registrados" ahora
+    tiene botones de acción (🔑 restablecer contraseña, 🗑️ eliminar cuenta)
+    directamente en cada fila, en vez de tener que usar un selector aparte.
+    Como st.dataframe no soporta botones dentro de las celdas, esa tabla
+    se reemplazó por una tabla "manual" construida con columnas.
+
+Cambios frente a la v2.2 (ya incluidos):
   - Nueva pestaña "¿Olvidaste tu contraseña?" en el login: permite a
     cualquier paciente (incluido el administrador) restablecer su propia
     contraseña usando un código de recuperación (secreto RECOVERY_CODE),
@@ -14,8 +21,6 @@ Cambios frente a la v2.2:
   - IMPORTANTE: agrega RECOVERY_CODE en Secrets (una cadena que solo tú
     conozcas) para que esta pestaña funcione. Sin ese secreto configurado,
     la pestaña muestra una advertencia y no permite restablecer nada.
-
-Cambios frente a la v2.1 (ya incluidos):
   - El panel de administrador permite ACTUAR, no solo ver:
       * Eliminar medicamentos de cualquier paciente.
       * Eliminar cuentas de pacientes (con confirmación explícita).
@@ -830,6 +835,64 @@ def es_admin(paciente):
     return paciente["correo"].lower().strip() == ADMIN_EMAIL.lower().strip()
 
 
+def _fila_paciente_admin(p):
+    """Dibuja una fila de la tabla de pacientes con botones de acción
+    (🔑 resetear contraseña, 🗑️ eliminar cuenta) directamente en la fila."""
+    c1, c2, c3, c4, c5 = st.columns([2.2, 3, 2, 0.8, 0.8])
+    c1.write(p["nombre"])
+    c2.write(p["correo"])
+    c3.write(p["created_at"][:16].replace("T", " "))
+
+    with c4:
+        if st.button("🔑", key=f"admin_reset_btn_{p['id']}", help="Restablecer contraseña"):
+            st.session_state[f"admin_mostrar_reset_{p['id']}"] = True
+
+    with c5:
+        if st.button("🗑️", key=f"admin_del_btn_{p['id']}", help="Eliminar cuenta"):
+            st.session_state[f"admin_mostrar_borrar_{p['id']}"] = True
+
+    if st.session_state.get(f"admin_mostrar_reset_{p['id']}"):
+        with st.form(f"form_admin_reset_row_{p['id']}"):
+            nueva_pw = st.text_input(
+                "Nueva contraseña (vacío = se genera una aleatoria)",
+                type="password", key=f"admin_nueva_pw_row_{p['id']}",
+            )
+            colf1, colf2 = st.columns(2)
+            confirmar = colf1.form_submit_button("Confirmar")
+            cancelar = colf2.form_submit_button("Cancelar")
+            if confirmar:
+                pw_final = nueva_pw.strip() if nueva_pw.strip() else secrets.token_urlsafe(9)
+                if len(pw_final) < 4:
+                    st.error("La contraseña debe tener al menos 4 caracteres.")
+                else:
+                    resetear_password_admin(p["id"], pw_final)
+                    st.session_state[f"admin_mostrar_reset_{p['id']}"] = False
+                    st.success(
+                        f"Nueva contraseña para {p['nombre']}: `{pw_final}` — "
+                        "cómunicasela de forma segura, no se envía sola por correo."
+                    )
+            if cancelar:
+                st.session_state[f"admin_mostrar_reset_{p['id']}"] = False
+                st.rerun()
+
+    if st.session_state.get(f"admin_mostrar_borrar_{p['id']}"):
+        st.warning(f"¿Eliminar la cuenta de **{p['nombre']}** ({p['correo']}) de forma permanente? "
+                   "Esto borra también sus medicamentos y su historial.")
+        colb1, colb2 = st.columns(2)
+        with colb1:
+            if st.button("Sí, eliminar", key=f"admin_del_si_{p['id']}"):
+                eliminar_paciente(p["id"])
+                st.session_state[f"admin_mostrar_borrar_{p['id']}"] = False
+                st.success(f"Cuenta de {p['nombre']} eliminada.")
+                st.rerun()
+        with colb2:
+            if st.button("Cancelar", key=f"admin_del_no_{p['id']}"):
+                st.session_state[f"admin_mostrar_borrar_{p['id']}"] = False
+                st.rerun()
+
+    st.divider()
+
+
 def seccion_admin():
     st.subheader("🛠️ Panel de administrador")
     st.caption(
@@ -846,11 +909,9 @@ def seccion_admin():
         n_recordatorios = conn.execute(
             "SELECT COUNT(*) AS n FROM eventos WHERE tipo = 'recordatorio_enviado'"
         ).fetchone()["n"]
-        pacientes_df = pd.read_sql_query(
-            "SELECT id, nombre, correo, created_at AS registrado_el FROM pacientes "
-            "ORDER BY created_at DESC",
-            conn,
-        )
+        todos_pacientes = [dict(r) for r in conn.execute(
+            "SELECT id, nombre, correo, created_at FROM pacientes ORDER BY created_at DESC"
+        ).fetchall()]
         eventos_recientes_df = pd.read_sql_query(
             """SELECT e.hora_evento, p.nombre AS paciente, e.tipo, e.medicamento_nombre
                FROM eventos e JOIN pacientes p ON p.id = e.patient_id
@@ -864,8 +925,28 @@ def seccion_admin():
     col3.metric("Eventos totales", n_eventos)
     col4.metric("Recordatorios enviados", n_recordatorios)
 
+    # ---------------------------------------------------------------
+    # TABLA DE PACIENTES CON ACCIONES (nuevo en v2.4): cada fila tiene
+    # sus propios botones de 🔑 resetear contraseña y 🗑️ eliminar cuenta,
+    # en vez de usar un selector aparte para elegir el paciente.
+    # ---------------------------------------------------------------
     st.markdown("**Pacientes registrados**")
-    st.dataframe(pacientes_df, use_container_width=True)
+    if not todos_pacientes:
+        st.info("Aún no hay pacientes registrados.")
+    else:
+        h1, h2, h3, h4, h5 = st.columns([2.2, 3, 2, 0.8, 0.8])
+        h1.markdown("**Nombre**")
+        h2.markdown("**Correo**")
+        h3.markdown("**Registrado el**")
+        h4.markdown("**🔑**")
+        h5.markdown("**🗑️**")
+        for p in todos_pacientes:
+            _fila_paciente_admin(p)
+
+        pacientes_df = pd.DataFrame(todos_pacientes)
+        csv_bytes = pacientes_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar listado de pacientes (CSV)", data=csv_bytes,
+                            file_name="pacientes_medicampus.csv", mime="text/csv")
 
     st.markdown("**Últimos 25 eventos (todos los pacientes)**")
     if eventos_recientes_df.empty:
@@ -873,29 +954,16 @@ def seccion_admin():
     else:
         st.dataframe(eventos_recientes_df, use_container_width=True)
 
-    csv_bytes = pacientes_df.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar listado de pacientes (CSV)", data=csv_bytes,
-                        file_name="pacientes_medicampus.csv", mime="text/csv")
-
     # ---------------------------------------------------------------
-    # GESTIÓN DE PACIENTES (nuevo en v2.2): aquí es donde el admin
-    # puede realmente actuar, no solo mirar.
+    # GESTIÓN DE MEDICAMENTOS POR PACIENTE: se mantiene aparte porque
+    # cada paciente puede tener varios medicamentos (no cabe en una fila).
     # ---------------------------------------------------------------
-    st.markdown("---")
-    st.markdown("**Gestión de pacientes**")
-    st.caption(
-        "Elimina medicamentos o cuentas de cualquier paciente, o restablece "
-        "su contraseña si te escribe porque no puede entrar."
-    )
-
-    with get_conn() as conn:
-        todos_pacientes = [dict(r) for r in conn.execute(
-            "SELECT id, nombre, correo FROM pacientes ORDER BY nombre"
-        ).fetchall()]
-
     if not todos_pacientes:
-        st.info("Aún no hay pacientes registrados.")
         return
+
+    st.markdown("---")
+    st.markdown("**Medicamentos de un paciente**")
+    st.caption("Elige un paciente para ver y, si hace falta, eliminar alguno de sus medicamentos.")
 
     opciones = {f"{p['nombre']} ({p['correo']})": p["id"] for p in todos_pacientes}
     seleccion = st.selectbox("Selecciona un paciente", list(opciones.keys()), key="admin_sel_paciente")
@@ -920,43 +988,6 @@ def seccion_admin():
                     st.rerun()
     else:
         st.caption(f"{paciente_sel['nombre']} no tiene medicamentos activos.")
-
-    col_reset, col_del = st.columns(2)
-
-    with col_reset:
-        with st.expander("🔑 Restablecer contraseña"):
-            nueva_pw = st.text_input(
-                "Nueva contraseña (déjalo vacío para generar una aleatoria)",
-                type="password", key=f"admin_nueva_pw_{pid_sel}",
-            )
-            if st.button("Restablecer contraseña", key=f"admin_reset_pw_{pid_sel}"):
-                pw_final = nueva_pw.strip() if nueva_pw.strip() else secrets.token_urlsafe(9)
-                if len(pw_final) < 4:
-                    st.error("La contraseña debe tener al menos 4 caracteres.")
-                else:
-                    resetear_password_admin(pid_sel, pw_final)
-                    st.success(
-                        f"Contraseña restablecida para {paciente_sel['nombre']}. "
-                        f"Nueva contraseña: `{pw_final}` — cómunicasela de forma segura, "
-                        "no queda guardada en ningún otro lugar ni se envía sola por correo."
-                    )
-
-    with col_del:
-        with st.expander("⚠️ Eliminar cuenta de este paciente"):
-            st.caption(
-                "Esto borra la cuenta, sus medicamentos y su historial de forma "
-                "permanente. No se puede deshacer."
-            )
-            confirma = st.checkbox(
-                "Confirmo que quiero eliminar esta cuenta",
-                key=f"admin_confirma_borrado_{pid_sel}",
-            )
-            if confirma:
-                if st.button("Eliminar cuenta definitivamente",
-                              key=f"admin_borrar_cuenta_{pid_sel}"):
-                    eliminar_paciente(pid_sel)
-                    st.success(f"Cuenta de {paciente_sel['nombre']} eliminada.")
-                    st.rerun()
 
 
 # ------------------------------------------------------------------
