@@ -2,9 +2,32 @@
 MediCampus - Asistente de medicamentos multi-paciente
 ======================================================
 
-Versión 2.0 - Reescritura completa
+Versión 2.1 - Correcciones y panel de administrador
 
-Novedades frente al prototipo original:
+Cambios frente a la v2.0:
+  - Panel de administrador: define ADMIN_EMAIL en Secrets. El paciente cuyo
+    correo de inicio de sesión coincida con ADMIN_EMAIL ve un panel extra
+    con el total de pacientes, medicamentos y eventos, y el listado de
+    cuentas registradas. ADMIN_EMAIL es independiente de EMAIL_USER: este
+    último es solo la cuenta SMTP desde la que se envían los correos, no
+    define quién administra la app. Puedes usar el mismo correo o uno
+    distinto (tu correo personal, por ejemplo) — solo regístrate como
+    paciente normal con ese correo y automáticamente verás el panel.
+  - Hash de contraseñas reforzado con PBKDF2-HMAC-SHA256 (200.000
+    iteraciones) en vez de un solo SHA-256, sin depender de librerías
+    externas nuevas. NOTA: si ya tenías cuentas creadas con la v2.0, el
+    formato de hash cambió; esas cuentas deberán registrarse de nuevo.
+  - Zona horaria explícita (por defecto America/Bogota, configurable con
+    el secreto TIMEZONE) en vez de depender de la hora del servidor, para
+    que "próxima dosis" y los recordatorios salgan a la hora correcta sin
+    importar dónde esté desplegada la app.
+  - SQLite en modo WAL + busy_timeout, para reducir bloqueos "database is
+    locked" cuando el scheduler en segundo plano escribe al mismo tiempo
+    que un usuario interactúa con la app.
+  - Aviso visible sobre la limitación de Streamlit Community Cloud: si la
+    app se "duerme" por inactividad, el scheduler en segundo plano también
+    se detiene y no se enviarán recordatorios automáticos hasta que alguien
+    vuelva a abrir la app.
   - Persistencia real en SQLite (medicamentos y pacientes ya no se pierden
     al recargar la página). NOTA: en Streamlit Community Cloud el disco es
     efímero: sobrevive a recargas y reinicios normales del contenedor, pero
@@ -30,13 +53,13 @@ de demostración y NO reemplaza la validación de un profesional de salud.
 
 import os
 import re
-import io
 import json
 import sqlite3
 import hashlib
 import secrets
 import contextlib
 from datetime import datetime, timedelta, date, time as dtime
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 import pandas as pd
@@ -77,7 +100,23 @@ ANTHROPIC_MODEL = "claude-sonnet-4-6"
 EMAIL_USER = get_secret("EMAIL_USER")
 EMAIL_PASSWORD = get_secret("EMAIL_PASSWORD")
 
+# Correo del paciente que debe ver el panel de administrador. Independiente
+# de EMAIL_USER (esa es solo la cuenta SMTP de envío). Puede ser el mismo
+# correo o uno distinto — quien inicie sesión con este correo ve el panel.
+ADMIN_EMAIL = get_secret("ADMIN_EMAIL")
+
+# Zona horaria para calcular "próxima dosis" y enviar recordatorios a la
+# hora local correcta, sin importar en qué región esté el servidor.
+NOMBRE_ZONA_HORARIA = get_secret("TIMEZONE", "America/Bogota")
+try:
+    ZONA_HORARIA = ZoneInfo(NOMBRE_ZONA_HORARIA)
+except Exception:
+    ZONA_HORARIA = ZoneInfo("America/Bogota")
+
 CORREO_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Iteraciones de PBKDF2 para el hash de contraseñas.
+PBKDF2_ITERACIONES = 200_000
 
 INTERACCIONES_DEMO = [
     {"a": "ibuprofeno", "b": "warfarina", "riesgo": "ALTO",
@@ -119,6 +158,21 @@ HORARIOS_COMIDA_DEFECTO = {
 UMBRAL_STOCK_BAJO = 3  # dosis restantes para alertar recompra
 
 
+def ahora_local():
+    """Hora actual, consciente de la zona horaria configurada (TIMEZONE)."""
+    return datetime.now(ZONA_HORARIA)
+
+
+def parsear_fecha(texto_iso):
+    """Convierte un ISO guardado en la BD a datetime consciente de zona
+    horaria. Soporta valores antiguos guardados sin zona (naive), a los
+    que les asigna la zona configurada."""
+    dt = datetime.fromisoformat(texto_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZONA_HORARIA)
+    return dt.astimezone(ZONA_HORARIA)
+
+
 # ------------------------------------------------------------------
 # CAPA DE BASE DE DATOS (SQLite)
 # ------------------------------------------------------------------
@@ -128,6 +182,10 @@ def get_conn():
     conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL + busy_timeout reducen los bloqueos "database is locked" cuando
+    # el scheduler de recordatorios escribe al mismo tiempo que un usuario.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 8000")
     try:
         yield conn
         conn.commit()
@@ -144,10 +202,16 @@ def init_db():
                 correo TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
+                pbkdf2_iteraciones INTEGER NOT NULL DEFAULT 200000,
                 horarios_comida TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
         """)
+        # Migración suave para bases creadas con la v2.0 (sin la columna).
+        columnas = [r["name"] for r in conn.execute("PRAGMA table_info(pacientes)").fetchall()]
+        if "pbkdf2_iteraciones" not in columnas:
+            conn.execute("ALTER TABLE pacientes ADD COLUMN pbkdf2_iteraciones INTEGER NOT NULL DEFAULT 200000")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS medicamentos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,8 +250,11 @@ def init_db():
 
 # ---------- utilidades de contraseña ----------
 
-def _hash_password(password, salt):
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+def _hash_password(password, salt, iteraciones=PBKDF2_ITERACIONES):
+    derivado = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), iteraciones
+    )
+    return derivado.hex()
 
 
 def crear_paciente(nombre, correo, password):
@@ -196,10 +263,11 @@ def crear_paciente(nombre, correo, password):
     with get_conn() as conn:
         try:
             cur = conn.execute(
-                "INSERT INTO pacientes (nombre, correo, password_hash, salt, horarios_comida, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (nombre, correo.lower().strip(), pw_hash, salt,
-                 json.dumps(HORARIOS_COMIDA_DEFECTO), datetime.now().isoformat()),
+                "INSERT INTO pacientes (nombre, correo, password_hash, salt, "
+                "pbkdf2_iteraciones, horarios_comida, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (nombre, correo.lower().strip(), pw_hash, salt, PBKDF2_ITERACIONES,
+                 json.dumps(HORARIOS_COMIDA_DEFECTO), ahora_local().isoformat()),
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
@@ -213,7 +281,8 @@ def autenticar_paciente(correo, password):
         ).fetchone()
         if row is None:
             return None
-        if _hash_password(password, row["salt"]) != row["password_hash"]:
+        iteraciones = row["pbkdf2_iteraciones"] or PBKDF2_ITERACIONES
+        if _hash_password(password, row["salt"], iteraciones) != row["password_hash"]:
             return None
         return dict(row)
 
@@ -255,7 +324,7 @@ def crear_medicamento(patient_id, data):
                 data.get("comida"), data.get("momento"), data.get("offset_min"),
                 data["hora_inicio"].isoformat(), data.get("duracion_dias"),
                 data.get("cantidad_total"), data.get("cantidad_total"),
-                data.get("cantidad_por_toma", 1), datetime.now().isoformat(),
+                data.get("cantidad_por_toma", 1), ahora_local().isoformat(),
             ),
         )
         return cur.lastrowid
@@ -312,7 +381,7 @@ def registrar_evento(patient_id, medicamento_id, medicamento_nombre, tipo, hora_
             (
                 patient_id, medicamento_id, medicamento_nombre, tipo,
                 hora_programada.isoformat() if hora_programada else None,
-                datetime.now().isoformat(), canal,
+                ahora_local().isoformat(), canal,
             ),
         )
 
@@ -346,23 +415,23 @@ def obtener_eventos_df(patient_id):
 
 def esta_finalizado(med):
     if med.get("duracion_dias"):
-        inicio = datetime.fromisoformat(med["hora_inicio"])
+        inicio = parsear_fecha(med["hora_inicio"])
         fin = inicio.date() + timedelta(days=int(med["duracion_dias"]))
-        return date.today() > fin
+        return ahora_local().date() > fin
     return False
 
 
 def calcular_proxima_dosis(med, horarios_comida):
-    """Calcula el próximo datetime de toma. Devuelve None si el
-    tratamiento ya finalizó según su duración configurada."""
+    """Calcula el próximo datetime de toma (consciente de zona horaria).
+    Devuelve None si el tratamiento ya finalizó según su duración."""
     if esta_finalizado(med):
         return None
 
-    ahora = datetime.now()
+    ahora = ahora_local()
     tipo = med["tipo_horario"]
 
     if tipo == "frecuencia":
-        proxima = datetime.fromisoformat(med["hora_inicio"])
+        proxima = parsear_fecha(med["hora_inicio"])
         frecuencia = med["frecuencia_horas"] or 8
         while proxima < ahora:
             proxima += timedelta(hours=frecuencia)
@@ -373,7 +442,7 @@ def calcular_proxima_dosis(med, horarios_comida):
         candidatos = []
         for h in horas:
             hh, mm = [int(x) for x in h.split(":")]
-            candidato = datetime.combine(ahora.date(), dtime(hh, mm))
+            candidato = datetime.combine(ahora.date(), dtime(hh, mm), tzinfo=ZONA_HORARIA)
             if candidato < ahora:
                 candidato += timedelta(days=1)
             candidatos.append(candidato)
@@ -385,7 +454,7 @@ def calcular_proxima_dosis(med, horarios_comida):
         offset = med["offset_min"] or 0
         hora_comida_str = horarios_comida.get(comida, HORARIOS_COMIDA_DEFECTO[comida])
         hh, mm = [int(x) for x in hora_comida_str.split(":")]
-        base = datetime.combine(ahora.date(), dtime(hh, mm))
+        base = datetime.combine(ahora.date(), dtime(hh, mm), tzinfo=ZONA_HORARIA)
         objetivo = base - timedelta(minutes=offset) if momento == "Antes" else base + timedelta(minutes=offset)
         if objetivo < ahora:
             objetivo += timedelta(days=1)
@@ -434,7 +503,7 @@ def enviar_recordatorio_email(paciente, med, hora_toma, manual=True):
         f"Este es tu recordatorio de MediCampus.\n\n"
         f"Medicamento: {med['nombre']}\n"
         f"Dosis: {med['dosis']}\n"
-        f"Debes tomarlo a las: {hora_toma.strftime('%d/%m/%Y %H:%M')}\n"
+        f"Debes tomarlo a las: {hora_toma.strftime('%d/%m/%Y %H:%M')} ({NOMBRE_ZONA_HORARIA})\n"
         f"Horario: {descripcion_horario(med)}\n\n"
         f"Ingresa a MediCampus y marca 'Ya la tomé' cuando la tomes, "
         f"para llevar tu registro de adherencia.\n\n"
@@ -451,13 +520,18 @@ def enviar_recordatorio_email(paciente, med, hora_toma, manual=True):
 def revisar_y_enviar_recordatorios():
     """Job de fondo (APScheduler): revisa TODOS los pacientes y medicamentos
     activos y envía un correo si la hora actual coincide (mismo minuto) con
-    la próxima dosis calculada y aún no se ha enviado ese recordatorio."""
+    la próxima dosis calculada y aún no se ha enviado ese recordatorio.
+
+    Limitación conocida: este job solo corre mientras el proceso de
+    Streamlit esté activo. En Streamlit Community Cloud, si la app se
+    "duerme" por inactividad, el scheduler se detiene con ella y no se
+    enviarán recordatorios hasta que alguien vuelva a abrir la app."""
     if not EMAIL_USER or not EMAIL_PASSWORD:
         return
     try:
         with get_conn() as conn:
             pacientes = [dict(r) for r in conn.execute("SELECT * FROM pacientes").fetchall()]
-        ahora = datetime.now()
+        ahora = ahora_local()
         for pac in pacientes:
             horarios_comida = json.loads(pac["horarios_comida"])
             meds = obtener_medicamentos(pac["id"])
@@ -476,7 +550,7 @@ def revisar_y_enviar_recordatorios():
 def iniciar_scheduler():
     if not EMAIL_USER or not EMAIL_PASSWORD:
         return None
-    sched = BackgroundScheduler(daemon=True)
+    sched = BackgroundScheduler(daemon=True, timezone=str(ZONA_HORARIA))
     sched.add_job(revisar_y_enviar_recordatorios, "interval", minutes=1,
                   id="job_recordatorios", replace_existing=True)
     sched.start()
@@ -587,7 +661,7 @@ def generar_pdf_historial(paciente, medicamentos, eventos_df):
     pdf.set_font("Helvetica", "", 11)
     pdf.cell(0, 8, f"Paciente: {paciente['nombre']}", ln=True)
     pdf.cell(0, 8, f"Correo: {paciente['correo']}", ln=True)
-    pdf.cell(0, 8, f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
+    pdf.cell(0, 8, f"Generado: {ahora_local().strftime('%d/%m/%Y %H:%M')} ({NOMBRE_ZONA_HORARIA})", ln=True)
     pdf.ln(4)
 
     pdf.set_font("Helvetica", "B", 13)
@@ -693,12 +767,75 @@ def pantalla_login():
 
 
 # ------------------------------------------------------------------
+# PANEL DE ADMINISTRADOR
+# ------------------------------------------------------------------
+
+def es_admin(paciente):
+    """True si el correo del paciente logueado coincide con ADMIN_EMAIL.
+    ADMIN_EMAIL es un secreto independiente de EMAIL_USER: define quién
+    administra la app, no desde dónde se envían los correos."""
+    if not ADMIN_EMAIL:
+        return False
+    return paciente["correo"].lower().strip() == ADMIN_EMAIL.lower().strip()
+
+
+def seccion_admin():
+    st.subheader("🛠️ Panel de administrador")
+    st.caption(
+        "Visible solo para la cuenta cuyo correo coincide con ADMIN_EMAIL "
+        "(configurado en Secrets). Los demás pacientes no ven esta sección."
+    )
+
+    with get_conn() as conn:
+        n_pacientes = conn.execute("SELECT COUNT(*) AS n FROM pacientes").fetchone()["n"]
+        n_meds_activos = conn.execute(
+            "SELECT COUNT(*) AS n FROM medicamentos WHERE activo = 1"
+        ).fetchone()["n"]
+        n_eventos = conn.execute("SELECT COUNT(*) AS n FROM eventos").fetchone()["n"]
+        n_recordatorios = conn.execute(
+            "SELECT COUNT(*) AS n FROM eventos WHERE tipo = 'recordatorio_enviado'"
+        ).fetchone()["n"]
+        pacientes_df = pd.read_sql_query(
+            "SELECT id, nombre, correo, created_at AS registrado_el FROM pacientes "
+            "ORDER BY created_at DESC",
+            conn,
+        )
+        eventos_recientes_df = pd.read_sql_query(
+            """SELECT e.hora_evento, p.nombre AS paciente, e.tipo, e.medicamento_nombre
+               FROM eventos e JOIN pacientes p ON p.id = e.patient_id
+               ORDER BY e.hora_evento DESC LIMIT 25""",
+            conn,
+        )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Pacientes registrados", n_pacientes)
+    col2.metric("Medicamentos activos", n_meds_activos)
+    col3.metric("Eventos totales", n_eventos)
+    col4.metric("Recordatorios enviados", n_recordatorios)
+
+    st.markdown("**Pacientes registrados**")
+    st.dataframe(pacientes_df, use_container_width=True)
+
+    st.markdown("**Últimos 25 eventos (todos los pacientes)**")
+    if eventos_recientes_df.empty:
+        st.info("Aún no hay eventos registrados en toda la app.")
+    else:
+        st.dataframe(eventos_recientes_df, use_container_width=True)
+
+    csv_bytes = pacientes_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Descargar listado de pacientes (CSV)", data=csv_bytes,
+                        file_name="pacientes_medicampus.csv", mime="text/csv")
+
+
+# ------------------------------------------------------------------
 # SECCIONES DE LA APP (usuario autenticado)
 # ------------------------------------------------------------------
 
 def sidebar_cuenta(paciente):
     st.sidebar.header(f"👤 {paciente['nombre']}")
     st.sidebar.caption(paciente["correo"])
+    if es_admin(paciente):
+        st.sidebar.caption("🛠️ Cuenta de administrador")
 
     if st.sidebar.button("🚪 Cerrar sesión"):
         st.session_state.patient_id = None
@@ -711,7 +848,13 @@ def sidebar_cuenta(paciente):
     else:
         st.sidebar.success("Recordatorios automáticos activos ✅")
         st.sidebar.caption(
-            "Se revisan cada minuto mientras la app esté activa en el servidor."
+            f"Se revisan cada minuto (zona horaria: {NOMBRE_ZONA_HORARIA}) mientras "
+            "la app esté activa en el servidor."
+        )
+        st.sidebar.caption(
+            "⚠️ En Streamlit Community Cloud, si la app se 'duerme' por "
+            "inactividad, los recordatorios automáticos se pausan hasta que "
+            "alguien vuelva a abrirla. El envío manual (botón 📧) siempre funciona."
         )
     if not ANTHROPIC_API_KEY:
         st.sidebar.warning("Sin ANTHROPIC_API_KEY: modo de respaldo activo para la IA.")
@@ -855,7 +998,7 @@ def seccion_registrar_medicamento(paciente):
                 data = {
                     "nombre": nombre,
                     "dosis": dosis or "No especificada",
-                    "hora_inicio": datetime.now(),
+                    "hora_inicio": ahora_local(),
                     "duracion_dias": duracion_dias,
                     "cantidad_total": cantidad_total,
                     "cantidad_por_toma": cantidad_por_toma,
@@ -886,7 +1029,7 @@ def seccion_registrar_medicamento(paciente):
                     "dosis": datos.get("dosis", "No especificada"),
                     "tipo_horario": "frecuencia",
                     "frecuencia_horas": int(datos.get("frecuencia_horas") or 8),
-                    "hora_inicio": datetime.now(),
+                    "hora_inicio": ahora_local(),
                     "duracion_dias": datos.get("duracion_dias"),
                 }
                 crear_medicamento(paciente["id"], data)
@@ -993,11 +1136,11 @@ def seccion_panel(paciente):
                 b1, b2, b3, b4 = st.columns(4)
                 with b1:
                     if st.button("📧", key=f"enviar_{m['id']}", help="Enviar recordatorio ahora"):
-                        ok, mensaje = enviar_recordatorio_email(paciente, m, proxima or datetime.now())
+                        ok, mensaje = enviar_recordatorio_email(paciente, m, proxima or ahora_local())
                         st.success(mensaje) if ok else st.error(mensaje)
                 with b2:
                     if st.button("✅", key=f"tomado_{m['id']}", help="Marcar como tomado ahora"):
-                        registrar_evento(paciente["id"], m["id"], m["nombre"], "confirmado", datetime.now())
+                        registrar_evento(paciente["id"], m["id"], m["nombre"], "confirmado", ahora_local())
                         if m["cantidad_total"] is not None:
                             descontar_stock(m["id"], m["cantidad_por_toma"] or 1)
                         st.success("Toma registrada ✅")
@@ -1106,6 +1249,10 @@ def main():
         "relación con las comidas y duración del tratamiento. "
         "**Prototipo académico — no constituye consejo médico.**"
     )
+
+    if es_admin(paciente):
+        seccion_admin()
+        st.markdown("---")
 
     seccion_horarios_comida(paciente)
     seccion_registrar_medicamento(paciente)
