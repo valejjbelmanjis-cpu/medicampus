@@ -1,3 +1,5 @@
-streamlit
-pandas
-requests
+streamlit>=1.32
+pandas>=2.0
+requests>=2.31
+apscheduler>=3.10
+fpdf2>=2.7
