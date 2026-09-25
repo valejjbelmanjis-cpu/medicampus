@@ -5,11 +5,17 @@ Proyecto transversal IA
 Funcionalidades:
 1. Registro de VARIOS estudiantes/pacientes, cada uno con su propio correo
 2. Registro manual o asistido por IA de medicamentos por paciente
-3. Panel de próximas dosis por paciente
-4. Verificador básico de interacciones (base local de demostración)
-5. Envío de recordatorio real por correo a CADA paciente individualmente
-6. Asistente de chat con IA
-7. Registro de uso exportable a CSV (evidencia funcional)
+3. Horarios de toma flexibles por medicamento:
+   - Cada cierto número de horas (frecuencia fija)
+   - A una hora fija del día (ej. "en la noche")
+   - Antes/después de una comida (desayuno, almuerzo, cena), con
+     minutos de offset, usando los horarios de comida propios de
+     cada paciente
+4. Panel de próximas dosis por paciente
+5. Verificador básico de interacciones (base local de demostración)
+6. Envío de recordatorio real por correo a CADA paciente individualmente
+7. Asistente de chat con IA
+8. Registro de uso exportable a CSV (evidencia funcional)
 
 IMPORTANTE: Este es un prototipo académico. La base de interacciones es
 de demostración y NO reemplaza la validación de un profesional de salud.
@@ -19,7 +25,7 @@ import os
 import json
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 import streamlit as st
 import pandas as pd
@@ -77,14 +83,29 @@ FRECUENCIA_HORAS = {
     "Cada 24 horas": 24,
 }
 
+TIPOS_HORARIO = [
+    "Cada cierto número de horas",
+    "A una hora fija cada día",
+    "Relacionado con una comida",
+]
+
+COMIDAS = ["Desayuno", "Almuerzo", "Cena"]
+MOMENTO_COMIDA = ["Antes", "Después"]
+
+HORARIOS_COMIDA_DEFECTO = {
+    "Desayuno": dtime(7, 0),
+    "Almuerzo": dtime(12, 30),
+    "Cena": dtime(19, 0),
+}
+
 
 # ------------------------------------------------------------------
-# ESTADO DE SESIÓN — ahora es una LISTA de pacientes
+# ESTADO DE SESIÓN — lista de pacientes
 # ------------------------------------------------------------------
 
 def init_state():
     if "pacientes" not in st.session_state:
-        st.session_state.pacientes = []  # cada uno: {nombre, correo, programa, medicamentos: []}
+        st.session_state.pacientes = []  # cada uno: {nombre, correo, programa, medicamentos: [], horarios_comida: {}}
     if "paciente_activo" not in st.session_state:
         st.session_state.paciente_activo = None
     if "chat_historial" not in st.session_state:
@@ -96,6 +117,68 @@ def obtener_paciente_activo():
         if p["nombre"] == st.session_state.paciente_activo:
             return p
     return None
+
+
+# ------------------------------------------------------------------
+# LÓGICA DE HORARIOS
+# ------------------------------------------------------------------
+
+def calcular_proxima_dosis(medicamento, paciente):
+    """Calcula el próximo datetime de toma según el tipo de horario
+    configurado para el medicamento."""
+    ahora = datetime.now()
+    tipo = medicamento.get("tipo_horario", "frecuencia")
+
+    if tipo == "frecuencia":
+        proxima = medicamento["hora_inicio"]
+        frecuencia = medicamento["frecuencia_horas"]
+        while proxima < ahora:
+            proxima += timedelta(hours=frecuencia)
+        return proxima
+
+    if tipo == "fijo":
+        hora_fija = medicamento["hora_fija"]
+        proxima = datetime.combine(ahora.date(), hora_fija)
+        if proxima < ahora:
+            proxima += timedelta(days=1)
+        return proxima
+
+    if tipo == "comida":
+        comida = medicamento["comida"]
+        momento = medicamento["momento"]
+        offset = medicamento["offset_min"]
+        horarios_comida = paciente.get("horarios_comida", HORARIOS_COMIDA_DEFECTO)
+        hora_comida = horarios_comida.get(comida, HORARIOS_COMIDA_DEFECTO[comida])
+        base = datetime.combine(ahora.date(), hora_comida)
+        if momento == "Antes":
+            objetivo = base - timedelta(minutes=offset)
+        else:
+            objetivo = base + timedelta(minutes=offset)
+        if objetivo < ahora:
+            objetivo += timedelta(days=1)
+        return objetivo
+
+    # Respaldo por si algún medicamento antiguo no tiene tipo_horario
+    return calcular_proxima_dosis(
+        {**medicamento, "tipo_horario": "frecuencia",
+         "frecuencia_horas": medicamento.get("frecuencia_horas", 8)},
+        paciente,
+    )
+
+
+def descripcion_horario(medicamento):
+    """Texto legible del horario, para mostrar en el panel y en el correo."""
+    tipo = medicamento.get("tipo_horario", "frecuencia")
+    if tipo == "frecuencia":
+        return f"cada {medicamento['frecuencia_horas']} horas"
+    if tipo == "fijo":
+        return f"todos los días a las {medicamento['hora_fija'].strftime('%H:%M')}"
+    if tipo == "comida":
+        return (
+            f"{medicamento['momento'].lower()} de {medicamento['comida'].lower()} "
+            f"({medicamento['offset_min']} min)"
+        )
+    return "horario no especificado"
 
 
 # ------------------------------------------------------------------
@@ -121,7 +204,7 @@ def enviar_recordatorio_email(paciente, medicamento, hora_toma):
         f"Medicamento: {medicamento['nombre']}\n"
         f"Dosis: {medicamento['dosis']}\n"
         f"Debes tomarlo a las: {hora_toma.strftime('%d/%m/%Y %H:%M')}\n"
-        f"Frecuencia: cada {medicamento['frecuencia_horas']} horas\n\n"
+        f"Horario: {descripcion_horario(medicamento)}\n\n"
         f"Este recordatorio quedó registrado en tu historial de MediCampus.\n\n"
         f"— MediCampus (prototipo académico, no reemplaza indicación médica)"
     )
@@ -151,6 +234,7 @@ def registrar_envio(paciente, medicamento, hora_toma):
         "correo": paciente.get("correo", ""),
         "medicamento": medicamento["nombre"],
         "dosis": medicamento["dosis"],
+        "horario": descripcion_horario(medicamento),
         "hora_toma_programada": hora_toma.strftime("%Y-%m-%d %H:%M:%S"),
     }])
     if os.path.exists(DATA_FILE):
@@ -248,14 +332,6 @@ def verificar_interacciones(medicamentos):
     return alertas
 
 
-def calcular_proxima_dosis(hora_inicio, frecuencia_horas):
-    ahora = datetime.now()
-    proxima = hora_inicio
-    while proxima < ahora:
-        proxima += timedelta(hours=frecuencia_horas)
-    return proxima
-
-
 # ------------------------------------------------------------------
 # INTERFAZ
 # ------------------------------------------------------------------
@@ -277,6 +353,7 @@ def sidebar_gestion_pacientes():
                     st.session_state.pacientes.append({
                         "nombre": nombre, "correo": correo, "programa": programa,
                         "medicamentos": [],
+                        "horarios_comida": dict(HORARIOS_COMIDA_DEFECTO),
                     })
                     st.session_state.paciente_activo = nombre
                     st.sidebar.success(f"{nombre} agregado.")
@@ -305,28 +382,100 @@ def sidebar_gestion_pacientes():
         st.sidebar.success("Asistente IA conectado ✅")
 
 
+def seccion_horarios_comida(paciente):
+    """Permite configurar las horas de comida propias de cada paciente,
+    usadas para calcular tomas 'antes/después de' una comida."""
+    if "horarios_comida" not in paciente:
+        paciente["horarios_comida"] = dict(HORARIOS_COMIDA_DEFECTO)
+
+    with st.expander(f"⚙️ Horarios de comida de {paciente['nombre']} (para tomas antes/después de comer)"):
+        horarios = paciente["horarios_comida"]
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            horarios["Desayuno"] = st.time_input(
+                "Desayuno", value=horarios.get("Desayuno", HORARIOS_COMIDA_DEFECTO["Desayuno"]),
+                key=f"h_desayuno_{paciente['nombre']}",
+            )
+        with col2:
+            horarios["Almuerzo"] = st.time_input(
+                "Almuerzo", value=horarios.get("Almuerzo", HORARIOS_COMIDA_DEFECTO["Almuerzo"]),
+                key=f"h_almuerzo_{paciente['nombre']}",
+            )
+        with col3:
+            horarios["Cena"] = st.time_input(
+                "Cena", value=horarios.get("Cena", HORARIOS_COMIDA_DEFECTO["Cena"]),
+                key=f"h_cena_{paciente['nombre']}",
+            )
+
+
 def seccion_registrar_medicamento(paciente):
     st.subheader(f"💊 Registrar medicamento para {paciente['nombre']}")
     tab_manual, tab_ia = st.tabs(["Formulario manual", "Pegar receta (IA extrae los datos)"])
 
     with tab_manual:
-        col1, col2, col3 = st.columns(3)
+        tipo_horario = st.radio(
+            "¿Cómo se debe tomar este medicamento?",
+            TIPOS_HORARIO,
+            key="man_tipo_horario",
+            horizontal=True,
+        )
+
+        col1, col2 = st.columns(2)
         with col1:
             nombre = st.text_input("Nombre del medicamento", key="man_nombre")
         with col2:
             dosis = st.text_input("Dosis (ej. 500 mg)", key="man_dosis")
-        with col3:
+
+        frecuencia_horas = None
+        hora_fija = None
+        comida = momento = None
+        offset_min = 0
+
+        if tipo_horario == "Cada cierto número de horas":
             frecuencia = st.selectbox("Frecuencia", list(FRECUENCIA_HORAS.keys()), key="man_frecuencia")
+            frecuencia_horas = FRECUENCIA_HORAS[frecuencia]
+
+        elif tipo_horario == "A una hora fija cada día":
+            hora_fija = st.time_input(
+                "Hora de la toma (ej. 22:00 para la noche)", value=dtime(21, 0), key="man_hora_fija",
+            )
+
+        else:  # Relacionado con una comida
+            colc1, colc2, colc3 = st.columns(3)
+            with colc1:
+                comida = st.selectbox("Comida", COMIDAS, key="man_comida")
+            with colc2:
+                momento = st.selectbox("Momento", MOMENTO_COMIDA, key="man_momento")
+            with colc3:
+                offset_min = st.number_input(
+                    "Minutos antes/después", min_value=0, max_value=180, value=30, step=5, key="man_offset",
+                )
+            st.caption(
+                "Se calculará usando el horario de comida configurado para "
+                f"{paciente['nombre']} (ver '⚙️ Horarios de comida' arriba)."
+            )
 
         if st.button("Agregar medicamento", key="btn_manual"):
             if nombre:
-                paciente["medicamentos"].append({
+                nuevo = {
                     "nombre": nombre,
                     "dosis": dosis or "No especificada",
-                    "frecuencia_horas": FRECUENCIA_HORAS[frecuencia],
                     "hora_inicio": datetime.now(),
-                })
-                st.success(f"'{nombre}' agregado a {paciente['nombre']}.")
+                }
+                if tipo_horario == "Cada cierto número de horas":
+                    nuevo["tipo_horario"] = "frecuencia"
+                    nuevo["frecuencia_horas"] = frecuencia_horas
+                elif tipo_horario == "A una hora fija cada día":
+                    nuevo["tipo_horario"] = "fijo"
+                    nuevo["hora_fija"] = hora_fija
+                else:
+                    nuevo["tipo_horario"] = "comida"
+                    nuevo["comida"] = comida
+                    nuevo["momento"] = momento
+                    nuevo["offset_min"] = offset_min
+
+                paciente["medicamentos"].append(nuevo)
+                st.success(f"'{nombre}' agregado a {paciente['nombre']} ({descripcion_horario(nuevo)}).")
             else:
                 st.error("Escribe al menos el nombre del medicamento.")
 
@@ -335,16 +484,23 @@ def seccion_registrar_medicamento(paciente):
             "Pega aquí el texto de la receta o indicación médica",
             placeholder="Ej: Ibuprofeno 400mg cada 8 horas por 5 días",
         )
+        st.caption(
+            "La IA extrae nombre, dosis y frecuencia en horas. Si el medicamento "
+            "debe tomarse a una hora fija o antes/después de una comida, agrégalo "
+            "o ajústalo con el formulario manual."
+        )
         if st.button("Extraer con IA", key="btn_ia"):
             if texto.strip():
                 with st.spinner("Analizando receta..."):
                     datos, modo = extraer_receta_con_ia(texto)
-                paciente["medicamentos"].append({
+                nuevo = {
                     "nombre": datos.get("nombre", "Medicamento"),
                     "dosis": datos.get("dosis", "No especificada"),
+                    "tipo_horario": "frecuencia",
                     "frecuencia_horas": int(datos.get("frecuencia_horas", 8)),
                     "hora_inicio": datetime.now(),
-                })
+                }
+                paciente["medicamentos"].append(nuevo)
                 etiqueta = "🤖 IA" if modo == "ia" else "🛟 modo de respaldo"
                 st.success(f"Extraído ({etiqueta}): {datos}")
             else:
@@ -361,11 +517,11 @@ def seccion_panel(paciente):
 
     filas = []
     for m in medicamentos:
-        proxima = calcular_proxima_dosis(m["hora_inicio"], m["frecuencia_horas"])
+        proxima = calcular_proxima_dosis(m, paciente)
         filas.append({
             "Medicamento": m["nombre"],
             "Dosis": m["dosis"],
-            "Frecuencia": f'cada {m["frecuencia_horas"]}h',
+            "Horario": descripcion_horario(m),
             "Próxima dosis": proxima.strftime("%d/%m/%Y %H:%M"),
         })
     st.dataframe(pd.DataFrame(filas), use_container_width=True)
@@ -377,10 +533,13 @@ def seccion_panel(paciente):
         "de tareas automáticamente a esa hora):"
     )
     for i, m in enumerate(medicamentos):
-        proxima = calcular_proxima_dosis(m["hora_inicio"], m["frecuencia_horas"])
+        proxima = calcular_proxima_dosis(m, paciente)
         col_a, col_b = st.columns([3, 1])
         with col_a:
-            st.write(f"{m['nombre']} — {m['dosis']} — próxima toma: {proxima.strftime('%d/%m/%Y %H:%M')}")
+            st.write(
+                f"{m['nombre']} — {m['dosis']} — {descripcion_horario(m)} — "
+                f"próxima toma: {proxima.strftime('%d/%m/%Y %H:%M')}"
+            )
         with col_b:
             if st.button("Enviar", key=f"enviar_{paciente['nombre']}_{i}"):
                 ok, mensaje = enviar_recordatorio_email(paciente, m, proxima)
@@ -437,7 +596,8 @@ def main():
     st.title("💊 MediCampus")
     st.markdown(
         "Asistente universitario de adherencia a medicamentos, con "
-        "recordatorios individuales por correo para cada paciente. "
+        "recordatorios individuales por correo para cada paciente, "
+        "respetando horarios fijos, frecuencias y relación con las comidas. "
         "**Prototipo académico — no constituye consejo médico.**"
     )
 
@@ -446,6 +606,7 @@ def main():
         st.warning("Agrega un paciente en la barra lateral izquierda para comenzar.")
         return
 
+    seccion_horarios_comida(paciente)
     seccion_registrar_medicamento(paciente)
     st.markdown("---")
     seccion_panel(paciente)
